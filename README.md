@@ -52,6 +52,23 @@ python3 scripts/chrome_session.py run \
   --wait-ms 4000
 ```
 
+Drive clicks and input — **including inside iframes** (payment forms, auth
+widgets, embedded apps) — by passing ordered action steps via `--actions`:
+
+```bash
+python3 scripts/chrome_session.py run \
+  --email you@example.com \
+  --url "https://example.com/checkout" \
+  --actions '[
+    {"action":"fill","selector":"#card","value":"4242...","frame_selector":"iframe[name=card]"},
+    {"action":"click","selector":"button[type=submit]"}
+  ]'
+```
+
+Each step may target an iframe via `frame_selector` (CSS of the `<iframe>`,
+robust cross-origin), `frame_url`, or `frame_name`; every `run` also returns a
+`frames` list so you can discover what to target.
+
 Dump page HTML, keep Chrome open for interactive work, or reuse a clone — see
 [`SKILL.md`](SKILL.md) for the full command reference and
 [`references/profile-mapping.md`](references/profile-mapping.md) for how the

@@ -69,6 +69,44 @@ python3 scripts/chrome_session.py run \
 First run creates the clone; subsequent runs are fast. Cookies stay fresh from
 the original profile.
 
+### Clicks & input — including INSIDE iframes
+Pass an ordered list of action steps via `--actions` (inline JSON) or
+`--actions-file <path>`. Each step optionally targets an iframe, so you can
+type/click inside embedded widgets (payment forms, auth iframes, embedded apps)
+that the main document can't reach.
+
+```bash
+python3 scripts/chrome_session.py run \
+  --email you@example.com \
+  --url "https://example.com/checkout" \
+  --actions '[
+    {"action":"fill","selector":"#card","value":"4242424242424242","frame_selector":"iframe[name=card]"},
+    {"action":"fill","selector":"#cvc","value":"123","frame_selector":"iframe[name=card]"},
+    {"action":"click","selector":"button[type=submit]"},
+    {"action":"wait_for","selector":"#success","frame_url":"checkout","state":"visible"}
+  ]' \
+  --screenshot /tmp/after.png --wait-ms 2000
+```
+
+**Discovering frames:** every `run` returns a `frames` array in its JSON output
+(`name` + `url` of each iframe). Use it to pick the right `frame_*` target.
+
+**Per-step frame targeting** (omit all three → acts on the main document):
+- `frame_selector` — CSS of the `<iframe>` element (most robust; works
+  cross-origin via Playwright FrameLocator). Comma-separate for **nested**
+  iframes: `"#outer,#inner"`.
+- `frame_url` — substring match against a frame's URL.
+- `frame_name` — exact frame `name`.
+
+**Actions:** `click`, `fill` (clears+sets), `type` (keystroke-by-keystroke),
+`press` (`{key}`, with or without `selector`), `select` (`{value}`), `check` /
+`uncheck`, `hover`, `wait_for` (`{state}`, default `visible`), `wait` (`{ms}`).
+Per-step `timeout` (ms) overrides the global `--action-timeout` (default 10000).
+Results report `ok`/`error` per step; one failing step does not abort the run.
+
+The same `--frame-selector` / `--frame-url` / `--frame-name` flags also scope a
+`--html` / `--screenshot` snapshot to a single iframe instead of the whole page.
+
 ## How it works
 
 1. **Find profile** matching the requested email via `Local State` JSON.

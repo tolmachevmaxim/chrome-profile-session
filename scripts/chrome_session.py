@@ -156,9 +156,117 @@ def wait_for_cdp(port: int, timeout: float = 25.0) -> str:
     raise RuntimeError(f'Chrome CDP not ready on :{port} within {timeout}s')
 
 
+def resolve_scope(page, *, frame_selector=None, frame_url=None, frame_name=None):
+    """Resolve where actions/snapshots apply: main page, a Frame, or a FrameLocator.
+
+    Targeting precedence: frame_selector > frame_url > frame_name > main frame.
+
+    - frame_selector: CSS of the <iframe> element. Most robust for cross-origin /
+      dynamic iframes (uses Playwright FrameLocator with auto-wait + re-resolution).
+      May be a list of CSS selectors to drill into NESTED iframes.
+    - frame_url / frame_name: substring (url) / exact (name) match against the
+      live frame tree. Use when you don't have a stable <iframe> CSS selector.
+
+    The returned object always exposes `.locator(css)`, so callers don't care
+    whether it's a Page main frame, a Frame, or a FrameLocator.
+    """
+    if frame_selector:
+        chain = frame_selector if isinstance(frame_selector, list) else [frame_selector]
+        fl = page.frame_locator(chain[0])
+        for sel in chain[1:]:
+            fl = fl.frame_locator(sel)
+        return fl
+    if frame_url or frame_name:
+        for fr in page.frames:
+            if frame_url and frame_url in (fr.url or ''):
+                return fr
+            if frame_name and frame_name == (fr.name or ''):
+                return fr
+        raise RuntimeError(f'iframe not found (url~={frame_url!r} name={frame_name!r}); '
+                           f'check the "frames" list in the JSON output')
+    return page.main_frame
+
+
+async def run_action(page, step: dict, default_timeout: int) -> dict:
+    """Execute one ordered action step. Returns a per-step result dict.
+
+    Each step is a dict: {"action": <name>, ...}. Frame targeting keys
+    (frame_selector / frame_url / frame_name) are optional per step — when set,
+    the action runs INSIDE that iframe instead of the main document.
+
+    Supported actions:
+      click   {selector}                 - click an element
+      fill    {selector, value}          - set an input's value (clears first)
+      type    {selector, value}          - keystroke-by-keystroke typing
+      press   {selector?, key}           - press a key (on element, or globally)
+      select  {selector, value}          - choose an <option> by value/label
+      check / uncheck {selector}         - toggle a checkbox/radio
+      hover   {selector}                 - hover an element
+      wait_for {selector, state?}        - wait until element visible (default)
+      wait    {ms}                       - sleep N milliseconds
+    """
+    action = step.get('action')
+    timeout = step.get('timeout', default_timeout)
+    rec: dict = {'action': action}
+    for k in ('selector', 'frame_selector', 'frame_url', 'frame_name'):
+        if step.get(k):
+            rec[k] = step[k]
+    try:
+        if action == 'wait':
+            await asyncio.sleep(step.get('ms', 0) / 1000)
+            rec['ok'] = True
+            return rec
+
+        scope = resolve_scope(
+            page,
+            frame_selector=step.get('frame_selector'),
+            frame_url=step.get('frame_url'),
+            frame_name=step.get('frame_name'),
+        )
+
+        if action in ('press',) and not step.get('selector'):
+            # Global keypress (no element target)
+            await page.keyboard.press(step['key'])
+        else:
+            loc = scope.locator(step['selector'])
+            if action == 'click':
+                await loc.click(timeout=timeout)
+            elif action == 'fill':
+                await loc.fill(step.get('value', ''), timeout=timeout)
+            elif action == 'type':
+                await loc.press_sequentially(step.get('value', ''), timeout=timeout)
+            elif action == 'press':
+                await loc.press(step['key'], timeout=timeout)
+            elif action == 'select':
+                await loc.select_option(step['value'], timeout=timeout)
+            elif action == 'check':
+                await loc.check(timeout=timeout)
+            elif action == 'uncheck':
+                await loc.uncheck(timeout=timeout)
+            elif action == 'hover':
+                await loc.hover(timeout=timeout)
+            elif action == 'wait_for':
+                await loc.wait_for(state=step.get('state', 'visible'), timeout=timeout)
+            else:
+                raise RuntimeError(f'unknown action {action!r}')
+        rec['ok'] = True
+    except Exception as e:
+        rec['ok'] = False
+        rec['error'] = repr(e)
+    return rec
+
+
 async def do_work(cdp_ws: str, *, url: str, screenshot: str | None,
-                  html_out: str | None, wait_ms: int, full_page: bool) -> dict:
-    """Attach Playwright to CDP, navigate, perform actions."""
+                  html_out: str | None, wait_ms: int, full_page: bool,
+                  actions: list | None = None, frame_selector=None,
+                  frame_url: str | None = None, frame_name: str | None = None,
+                  action_timeout: int = 10000) -> dict:
+    """Attach Playwright to CDP, navigate, run actions, snapshot.
+
+    When a frame target (frame_selector / frame_url / frame_name) is given at the
+    top level, the --html / --screenshot snapshot is taken of THAT iframe instead
+    of the whole page.
+    """
     from playwright.async_api import async_playwright
     result: dict = {}
     async with async_playwright() as p:
@@ -183,16 +291,89 @@ async def do_work(cdp_ws: str, *, url: str, screenshot: str | None,
             pass
         result['url'] = page.url
         result['title'] = await page.title()
+
+        # Enumerate the live frame tree so the caller can discover which iframe to
+        # target (url/name) without guessing. Skips the main frame (index 0).
+        try:
+            frames = []
+            for fr in page.frames:
+                if fr is page.main_frame:
+                    continue
+                frames.append({'name': fr.name or None, 'url': fr.url or None})
+            result['frames'] = frames
+        except Exception:
+            pass
+
+        # Run ordered actions (clicks / input — including inside iframes)
+        if actions:
+            result['actions'] = []
+            for step in actions:
+                rec = await run_action(page, step, action_timeout)
+                result['actions'].append(rec)
+
+        # Snapshot scope: a specific iframe if requested, else the whole page.
+        snap_frame = None
+        if frame_selector or frame_url or frame_name:
+            try:
+                snap_frame = resolve_scope(page, frame_selector=frame_selector,
+                                           frame_url=frame_url, frame_name=frame_name)
+            except Exception as e:
+                result['frame_error'] = repr(e)
+
         if screenshot:
-            await page.screenshot(path=screenshot, full_page=full_page)
+            if snap_frame is not None:
+                # Screenshot just the <iframe> element's box.
+                target = snap_frame.locator(':root') if hasattr(snap_frame, 'frame_locator') \
+                    else page.locator('iframe')
+                try:
+                    await target.screenshot(path=screenshot)
+                except Exception:
+                    await page.screenshot(path=screenshot, full_page=full_page)
+            else:
+                await page.screenshot(path=screenshot, full_page=full_page)
             result['screenshot'] = screenshot
         if html_out:
-            html = await page.content()
+            if snap_frame is not None:
+                # Frame.content() for a Frame; for a FrameLocator grab outerHTML.
+                if hasattr(snap_frame, 'content'):
+                    html = await snap_frame.content()
+                else:
+                    html = await snap_frame.locator(':root').evaluate('el => el.outerHTML')
+            else:
+                html = await page.content()
             pathlib.Path(html_out).write_text(html, encoding='utf-8')
             result['html'] = html_out
             result['html_bytes'] = len(html)
         # Don't close the browser — caller decides via --keep-open
         return result
+
+
+def parse_frame_selector(raw: str | None):
+    """A single CSS selector, or comma-separated CSS selectors for nested iframes."""
+    if not raw:
+        return None
+    parts = [s.strip() for s in raw.split(',') if s.strip()]
+    return parts if len(parts) > 1 else parts[0]
+
+
+def load_actions(args) -> list | None:
+    """Build the ordered action list from --actions (JSON) or --actions-file.
+
+    Accepts either a JSON array of step objects, or a single step object.
+    """
+    raw = None
+    if args.actions_file:
+        raw = pathlib.Path(args.actions_file).read_text(encoding='utf-8')
+    elif args.actions:
+        raw = args.actions
+    if not raw:
+        return None
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        sys.exit('--actions must be a JSON array of step objects (or one object)')
+    return data
 
 
 def cmd_list(args):
@@ -236,6 +417,11 @@ def cmd_run(args):
             html_out=args.html,
             wait_ms=args.wait_ms,
             full_page=args.full_page,
+            actions=load_actions(args),
+            frame_selector=parse_frame_selector(args.frame_selector),
+            frame_url=args.frame_url,
+            frame_name=args.frame_name,
+            action_timeout=args.action_timeout,
         ))
         # Output JSON result to stdout (only thing on stdout)
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -271,6 +457,23 @@ def main():
     p.add_argument('--html', help='Save page HTML to this path')
     p.add_argument('--wait-ms', type=int, default=1500,
                    help='Sleep after navigation before snapshot (default: 1500ms)')
+    # --- iframe targeting (for --html/--screenshot snapshot + per-step default) ---
+    p.add_argument('--frame-selector',
+                   help='CSS of the <iframe> element to snapshot. Comma-separate '
+                        'for nested iframes, e.g. "#outer,#inner". Most robust.')
+    p.add_argument('--frame-url',
+                   help='Substring of a frame URL to snapshot (fallback to selector)')
+    p.add_argument('--frame-name',
+                   help='Exact name of a frame to snapshot')
+    # --- ordered actions: clicks / input, incl. inside iframes ---
+    p.add_argument('--actions',
+                   help='JSON array of ordered action steps (clicks/input). Each '
+                        'step may carry frame_selector/frame_url/frame_name to act '
+                        'INSIDE an iframe. See SKILL.md for the step schema.')
+    p.add_argument('--actions-file',
+                   help='Path to a JSON file with the action steps (alt to --actions)')
+    p.add_argument('--action-timeout', type=int, default=10000,
+                   help='Per-step timeout in ms (default: 10000)')
     p.add_argument('--port', type=int, default=0,
                    help='CDP port (0 = random free port)')
     p.add_argument('--user-data-dir',
